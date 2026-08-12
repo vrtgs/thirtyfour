@@ -17,6 +17,23 @@ pub mod scriptret;
 ///
 /// [`SessionHandle`]: handle::SessionHandle
 pub trait DriverGuard: Send + Sync + std::fmt::Debug + 'static {
+    /// Asynchronously release the external resource after the session has
+    /// ended. Implementations must be idempotent because concurrent clones can
+    /// call [`SessionHandle::quit`](handle::SessionHandle::quit) at the same
+    /// time.
+    ///
+    /// The default does nothing. Resource-owning guards should retain a
+    /// synchronous `Drop` fallback for callers that do not explicitly await
+    /// session cleanup.
+    #[doc(hidden)]
+    fn release(
+        &self,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = crate::error::WebDriverResult<()>> + Send + '_>,
+    > {
+        Box::pin(async { Ok(()) })
+    }
+
     /// Downcast helper used by [`crate::WebDriver::driver_id`] and friends to
     /// reach concrete guard types (e.g. the manager's `SessionGuard`). Default
     /// returns a placeholder; types with no useful runtime info don't need to

@@ -1,10 +1,6 @@
-use std::future::{Future, IntoFuture};
-use std::panic::AssertUnwindSafe;
-
-use futures_util::FutureExt;
-
-use crate::WebDriver;
 use crate::error::{WebDriverError, WebDriverResult};
+use crate::{WebDriver, WebDriverRunError};
+use std::future::{Future, IntoFuture};
 
 /// An error produced while setting up, running, or cleaning up a browser test.
 ///
@@ -107,44 +103,25 @@ where
     Fut: Future<Output = Result<T, E>>,
 {
     let driver = session.into_future().await.map_err(BrowserTestError::Setup)?;
-    let body_driver = driver.clone();
-    let body_result = AssertUnwindSafe(async move { test(body_driver).await }).catch_unwind().await;
-    let cleanup_result = AssertUnwindSafe(driver.quit()).catch_unwind().await;
-
-    match body_result {
-        Ok(body_result) => match cleanup_result {
-            Ok(cleanup_result) => match (body_result, cleanup_result) {
-                (Ok(value), Ok(())) => Ok(value),
-                (Ok(_), Err(cleanup)) => Err(BrowserTestError::Cleanup(cleanup)),
-                (Err(body), Ok(())) => Err(BrowserTestError::Body(body)),
-                (Err(body), Err(cleanup)) => Err(BrowserTestError::BodyAndCleanup {
-                    body,
-                    cleanup,
-                }),
-            },
-            Err(cleanup_panic) => std::panic::resume_unwind(cleanup_panic),
-        },
-        Err(body_panic) => {
-            match cleanup_result {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => {
-                    tracing::warn!(
-                        %error,
-                        "browser cleanup failed while unwinding a browser test panic"
-                    );
-                }
-                Err(_) => {
-                    tracing::warn!("browser cleanup panicked while unwinding a browser test panic");
-                }
-            }
-            std::panic::resume_unwind(body_panic)
-        }
+    match driver.run_and_quit(test).await {
+        Ok(value) => Ok(value),
+        Err(WebDriverRunError::Body(body)) => Err(BrowserTestError::Body(body)),
+        Err(WebDriverRunError::Cleanup(cleanup)) => Err(BrowserTestError::Cleanup(cleanup)),
+        Err(WebDriverRunError::BodyAndCleanup {
+            body,
+            cleanup,
+        }) => Err(BrowserTestError::BodyAndCleanup {
+            body,
+            cleanup,
+        }),
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use futures_util::FutureExt;
     use std::fmt::{Display, Formatter};
+    use std::panic::AssertUnwindSafe;
     use std::sync::Arc;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 
@@ -212,6 +189,14 @@ mod tests {
         fail_first_delete: bool,
         panic_first_delete: bool,
     ) -> (WebDriver, Arc<ClientState>) {
+        test_driver_with_guard(fail_first_delete, panic_first_delete, None)
+    }
+
+    fn test_driver_with_guard(
+        fail_first_delete: bool,
+        panic_first_delete: bool,
+        driver_guard: Option<Arc<dyn crate::session::DriverGuard>>,
+    ) -> (WebDriver, Arc<ClientState>) {
         let state = Arc::new(ClientState {
             delete_attempts: AtomicUsize::new(0),
             fail_first_delete: AtomicBool::new(fail_first_delete),
@@ -223,7 +208,7 @@ mod tests {
             "http://localhost:4444",
             SessionId::from("test-session"),
             WebDriverConfig::default(),
-            None,
+            driver_guard,
             Capabilities::new(),
         )
         .expect("valid test session");
@@ -240,11 +225,42 @@ mod tests {
     async fn returns_body_value_after_successful_cleanup() {
         let (driver, state) = test_driver(false);
 
-        let result =
-            run_browser_test(async { Ok(driver) }, |_| async { Ok::<_, BodyError>(42) }).await;
+        let result = driver.run_and_quit(|_| async { Ok::<_, BodyError>(42) }).await;
 
-        assert_eq!(result.expect("test succeeds"), 42);
+        assert_eq!(result.expect("operation succeeds"), 42);
         assert_eq!(state.delete_attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[derive(Debug)]
+    struct RecordingGuard(Arc<AtomicUsize>);
+
+    impl crate::session::DriverGuard for RecordingGuard {
+        fn release(
+            &self,
+        ) -> std::pin::Pin<Box<dyn Future<Output = WebDriverResult<()>> + Send + '_>> {
+            Box::pin(async move {
+                tokio::task::yield_now().await;
+                self.0.fetch_add(1, Ordering::SeqCst);
+                Ok(())
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn run_and_quit_awaits_driver_guard_release() {
+        let releases = Arc::new(AtomicUsize::new(0));
+        let guard: Arc<dyn crate::session::DriverGuard> =
+            Arc::new(RecordingGuard(Arc::clone(&releases)));
+        let (driver, state) = test_driver_with_guard(false, false, Some(guard));
+
+        let value = driver
+            .run_and_quit(|_| async { Ok::<_, BodyError>(42) })
+            .await
+            .expect("operation and cleanup succeed");
+
+        assert_eq!(value, 42);
+        assert_eq!(state.delete_attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(releases.load(Ordering::SeqCst), 1);
     }
 
     #[tokio::test]
