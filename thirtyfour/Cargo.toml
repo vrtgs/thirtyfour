@@ -1,6 +1,6 @@
 [package]
 name = "thirtyfour"
-version = "0.37.4"
+version = "0.37.5"
 edition = "2024"
 description = """
 Thirtyfour is a Selenium / WebDriver library for Rust, for automated website UI testing.

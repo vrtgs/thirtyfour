@@ -148,6 +148,22 @@ impl ManagedDriverProcess {
     {
         self.log_subscribers.add(f)
     }
+
+    /// Kill the driver and wait until the OS has reaped it.
+    ///
+    /// This consumes the process after the final managed-session lease is
+    /// released. [`Drop`] remains the non-blocking fallback when explicit
+    /// asynchronous cleanup is skipped or cancelled.
+    pub(crate) async fn shutdown(mut self) -> std::io::Result<()> {
+        self.shutdown.store(true, Ordering::Relaxed);
+        for handle in self.pump_handles.drain(..) {
+            handle.abort();
+        }
+        if let Some(mut child) = self.child.take() {
+            child.kill().await?;
+        }
+        Ok(())
+    }
 }
 
 /// Heuristic: did this error come from the OS reporting that the chosen port
@@ -377,8 +393,9 @@ impl Drop for ManagedDriverProcess {
         self.shutdown.store(true, Ordering::Relaxed);
         // Sync drop, so we can't await. `start_kill` issues SIGKILL (or
         // TerminateProcess on Windows) without blocking; `kill_on_drop(true)`
-        // set on the Command ensures the child is reaped asynchronously when
-        // the Child handle drops.
+        // asks Tokio to reap the child on a best-effort basis when the Child
+        // handle drops. Explicit `WebDriver::quit().await` uses `shutdown()`
+        // above and waits for reaping instead.
         if let Some(mut child) = self.child.take()
             && let Err(e) = child.start_kill()
         {

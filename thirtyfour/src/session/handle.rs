@@ -1228,6 +1228,9 @@ impl SessionHandle {
         self.quit
             .get_or_try_init(|| async { self.cmd(Command::DeleteSession).await.map(drop) })
             .await?;
+        if let Some(driver_guard) = &self.driver_guard {
+            driver_guard.release().await?;
+        }
         Ok(())
     }
 

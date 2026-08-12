@@ -1,10 +1,12 @@
 use std::fmt::Formatter;
 use std::future::{Future, IntoFuture};
 use std::ops::Deref;
+use std::panic::AssertUnwindSafe;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Duration;
 
+use futures_util::FutureExt;
 use http::HeaderValue;
 
 use crate::Capabilities;
@@ -45,6 +47,55 @@ pub struct WebDriver {
 #[derive(Debug, thiserror::Error)]
 #[error("Webdriver has already quit, can't leak an already quit driver")]
 pub struct AlreadyQuit(pub(crate) ());
+
+/// An error returned by [`WebDriver::run_and_quit`].
+///
+/// Body and cleanup failures are retained together rather than allowing
+/// cleanup to hide the operation's original failure.
+#[derive(Debug, thiserror::Error)]
+#[non_exhaustive]
+pub enum WebDriverRunError<E = WebDriverError> {
+    /// The operation failed and browser cleanup succeeded.
+    #[error("browser operation failed: {0}")]
+    Body(E),
+    /// The operation succeeded but browser cleanup failed.
+    #[error("browser cleanup failed: {0}")]
+    Cleanup(WebDriverError),
+    /// Both the operation and browser cleanup failed.
+    #[error("browser operation failed: {body}; browser cleanup also failed: {cleanup}")]
+    BodyAndCleanup {
+        /// The original operation error.
+        body: E,
+        /// The failure returned by [`WebDriver::quit`].
+        cleanup: WebDriverError,
+    },
+}
+
+impl<E> WebDriverRunError<E> {
+    /// Return the operation error, if the operation failed.
+    pub fn body_error(&self) -> Option<&E> {
+        match self {
+            Self::Body(error)
+            | Self::BodyAndCleanup {
+                body: error,
+                ..
+            } => Some(error),
+            Self::Cleanup(_) => None,
+        }
+    }
+
+    /// Return the cleanup error, if browser cleanup failed.
+    pub fn cleanup_error(&self) -> Option<&WebDriverError> {
+        match self {
+            Self::Cleanup(error)
+            | Self::BodyAndCleanup {
+                cleanup: error,
+                ..
+            } => Some(error),
+            Self::Body(_) => None,
+        }
+    }
+}
 
 impl WebDriver {
     /// Create a new WebDriver as follows:
@@ -282,7 +333,7 @@ impl WebDriver {
         let guard = self.handle.driver_guard()?;
         let session_guard =
             guard.as_any().downcast_ref::<crate::manager::manager_internal::SessionGuard>()?;
-        Some(session_guard.driver.driver_id)
+        session_guard.driver_id()
     }
 
     /// Subscribe to log lines from just this session's driver process. Returns
@@ -302,10 +353,14 @@ impl WebDriver {
         let guard = self.handle.driver_guard()?;
         let session_guard =
             guard.as_any().downcast_ref::<crate::manager::manager_internal::SessionGuard>()?;
-        Some(session_guard.driver.subscribe_log(f))
+        session_guard.subscribe_log(f)
     }
 
     /// End the webdriver session and close the browser.
+    ///
+    /// For a locally managed browser, quitting the final session also waits
+    /// for the driver subprocess to exit. A driver shared by other live
+    /// sessions remains running until the final session quits.
     ///
     /// **NOTE:** Although `WebDriver` does close when all instances go out of scope.
     ///           When this happens it blocks the current executor,
@@ -315,6 +370,77 @@ impl WebDriver {
     ///           and possibly panic or report back to the user
     pub async fn quit(self) -> WebDriverResult<()> {
         self.handle.quit().await
+    }
+
+    /// Run an asynchronous operation, then safely quit the browser and return
+    /// the operation's value.
+    ///
+    /// The operation receives a clone of this driver. Cleanup is attempted
+    /// after success, an error, or a panic. Panics resume after cleanup; if
+    /// cleanup also panics or fails while unwinding, the original operation
+    /// panic takes precedence.
+    ///
+    /// The returned future must be driven to completion. Cancelling it can
+    /// interrupt asynchronous cleanup, in which case the synchronous `Drop`
+    /// fallback still requests process termination.
+    ///
+    /// # Example
+    ///
+    /// ```no_run
+    /// # use thirtyfour::prelude::*;
+    /// # async fn run() -> Result<(), Box<dyn std::error::Error>> {
+    /// let driver = WebDriver::managed(DesiredCapabilities::chrome()).await?;
+    /// let title = driver
+    ///     .run_and_quit(|driver| async move {
+    ///         driver.goto("https://example.com").await?;
+    ///         driver.title().await
+    ///     })
+    ///     .await?;
+    /// assert_eq!(title, "Example Domain");
+    /// # Ok(())
+    /// # }
+    /// ```
+    pub async fn run_and_quit<F, Fut, T, E>(self, operation: F) -> Result<T, WebDriverRunError<E>>
+    where
+        F: FnOnce(WebDriver) -> Fut,
+        Fut: Future<Output = Result<T, E>>,
+    {
+        let operation_driver = self.clone();
+        let operation_result =
+            AssertUnwindSafe(async move { operation(operation_driver).await }).catch_unwind().await;
+        let cleanup_result = AssertUnwindSafe(self.quit()).catch_unwind().await;
+
+        match operation_result {
+            Ok(operation_result) => match cleanup_result {
+                Ok(cleanup_result) => match (operation_result, cleanup_result) {
+                    (Ok(value), Ok(())) => Ok(value),
+                    (Ok(_), Err(cleanup)) => Err(WebDriverRunError::Cleanup(cleanup)),
+                    (Err(body), Ok(())) => Err(WebDriverRunError::Body(body)),
+                    (Err(body), Err(cleanup)) => Err(WebDriverRunError::BodyAndCleanup {
+                        body,
+                        cleanup,
+                    }),
+                },
+                Err(cleanup_panic) => std::panic::resume_unwind(cleanup_panic),
+            },
+            Err(operation_panic) => {
+                match cleanup_result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        tracing::warn!(
+                            %error,
+                            "browser cleanup failed while unwinding an operation panic"
+                        );
+                    }
+                    Err(_) => {
+                        tracing::warn!(
+                            "browser cleanup panicked while unwinding an operation panic"
+                        );
+                    }
+                }
+                std::panic::resume_unwind(operation_panic)
+            }
+        }
     }
 
     /// Leak the webdriver session and prevent it from being closed,

@@ -5,7 +5,7 @@ use std::net::{IpAddr, Ipv4Addr};
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, Weak};
+use std::sync::{Arc, Mutex as StdMutex, MutexGuard as StdMutexGuard, Weak};
 use std::time::Duration;
 
 use serde_json::Value;
@@ -130,7 +130,7 @@ impl DriverGuard for ManagedDriverProcess {}
 /// underlying [`ManagedDriverProcess`] alive for the lifetime of the session,
 /// and emits [`Status::SessionEnded`] when dropped.
 pub(crate) struct SessionGuard {
-    pub(crate) driver: Arc<ManagedDriverProcess>,
+    driver: StdMutex<Option<Arc<ManagedDriverProcess>>>,
     emitter: Emitter,
     browser: BrowserKind,
     session_id: String,
@@ -141,8 +141,25 @@ impl std::fmt::Debug for SessionGuard {
         f.debug_struct("SessionGuard")
             .field("browser", &self.browser)
             .field("session_id", &self.session_id)
-            .field("driver", &self.driver)
+            .field("driver", &self.driver())
             .finish_non_exhaustive()
+    }
+}
+
+impl SessionGuard {
+    fn driver(&self) -> StdMutexGuard<'_, Option<Arc<ManagedDriverProcess>>> {
+        self.driver.lock().unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    pub(crate) fn driver_id(&self) -> Option<DriverId> {
+        self.driver().as_ref().map(|driver| driver.driver_id)
+    }
+
+    pub(crate) fn subscribe_log<F>(&self, f: F) -> Option<DriverLogSubscription>
+    where
+        F: Fn(&DriverLogLine) + Send + Sync + 'static,
+    {
+        self.driver().as_ref().map(|driver| driver.subscribe_log(f))
     }
 }
 
@@ -156,6 +173,18 @@ impl Drop for SessionGuard {
 }
 
 impl DriverGuard for SessionGuard {
+    fn release(&self) -> Pin<Box<dyn Future<Output = WebDriverResult<()>> + Send + '_>> {
+        Box::pin(async move {
+            let driver = self.driver().take();
+            if let Some(driver) = driver
+                && let Some(process) = Arc::into_inner(driver)
+            {
+                process.shutdown().await.map_err(WebDriverError::from)?;
+            }
+            Ok(())
+        })
+    }
+
     fn as_any(&self) -> &dyn std::any::Any {
         self
     }
@@ -530,7 +559,7 @@ impl WebDriverManager {
             url: server_url.to_string(),
         });
         let guard: Arc<dyn DriverGuard> = Arc::new(SessionGuard {
-            driver,
+            driver: StdMutex::new(Some(driver)),
             emitter: self.emitter.clone(),
             browser,
             session_id: session_id.to_string(),

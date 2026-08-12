@@ -73,10 +73,15 @@ fn edge_caps() -> EdgeCapabilities {
 async fn managed_chrome_smoke() -> WebDriverResult<()> {
     with_timeout(async {
         let driver = WebDriver::managed(chrome_caps()).await?;
+        let server_url = driver.server_url().clone();
         if !skip_navigation() {
             driver.goto("about:blank").await?;
         }
         driver.quit().await?;
+        assert!(
+            !driver_is_listening(&server_url).await,
+            "quit().await must not return while chromedriver is still listening"
+        );
         Ok(())
     })
     .await
@@ -164,7 +169,40 @@ async fn managed_chrome_options_and_dedup() -> WebDriverResult<()> {
         }
 
         d1.quit().await?;
+        assert!(
+            driver_is_listening(d2.server_url()).await,
+            "quitting one shared session must keep chromedriver alive"
+        );
+        let server_url = d2.server_url().clone();
         d2.quit().await?;
+        assert!(
+            !driver_is_listening(&server_url).await,
+            "quitting the final shared session must await chromedriver exit"
+        );
+        Ok(())
+    })
+    .await
+}
+
+/// Concurrent explicit cleanup of every session sharing one chromedriver must
+/// still leave exactly one caller responsible for awaiting process exit.
+#[tokio::test(flavor = "multi_thread")]
+async fn concurrent_quit_awaits_shared_chromedriver_exit() -> WebDriverResult<()> {
+    with_timeout(async {
+        let mgr = WebDriverManager::builder().build();
+        let d1 = mgr.launch(chrome_caps()).await?;
+        let d2 = mgr.launch(chrome_caps()).await?;
+        let server_url = d1.server_url().clone();
+        assert_eq!(d2.server_url(), &server_url);
+
+        let (r1, r2) = tokio::join!(d1.quit(), d2.quit());
+        r1?;
+        r2?;
+
+        assert!(
+            !driver_is_listening(&server_url).await,
+            "concurrent quit().await calls must await the shared chromedriver exit"
+        );
         Ok(())
     })
     .await

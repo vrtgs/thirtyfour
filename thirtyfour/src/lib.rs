@@ -223,7 +223,7 @@ pub use common::{
     requestdata::*,
     types::*,
 };
-pub use web_driver::{WebDriver, WebDriverBuilder};
+pub use web_driver::{WebDriver, WebDriverBuilder, WebDriverRunError};
 pub use web_element::WebElement;
 
 /// Allow importing the common types via `use thirtyfour::prelude::*`.
