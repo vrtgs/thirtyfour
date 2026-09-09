@@ -94,7 +94,7 @@ tokio-tungstenite = { version = "0.30", default-features = false, features = [
 ], optional = true }
 
 # Optional dependencies pulled in by the `manager` feature.
-dirs = { version = "6", optional = true }
+dirs = { version = "7", optional = true }
 fs4 = { version = "1.1", default-features = false, features = [
     "tokio",
 ], optional = true }
